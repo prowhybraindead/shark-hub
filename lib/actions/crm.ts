@@ -376,3 +376,105 @@ export async function approveInvoice(invoiceId: string) {
       read: false, createdAt: FieldValue.serverTimestamp(),
     })
 }
+
+// ── Edit Invoice (UNPAID only) ────────────────────────────────────────────────
+export async function editInvoice(invoiceId: string, newAmount: number, newTargetPlan: string) {
+  await requireAdmin()
+  const db = getAdminDb()
+  const ref = db.collection("invoices").doc(invoiceId)
+  const doc = await ref.get()
+  if (!doc.exists) throw new Error("Invoice không tồn tại")
+  if (doc.data()!.status !== "UNPAID") throw new Error("Chỉ sửa được hóa đơn chưa thanh toán")
+  if (newAmount <= 0) throw new Error("Số tiền không hợp lệ")
+  await ref.update({
+    amount: newAmount,
+    targetPlan: newTargetPlan,
+    updatedAt: FieldValue.serverTimestamp(),
+  })
+}
+
+// ── Cancel Invoice (UNPAID only) ──────────────────────────────────────────────
+export async function cancelInvoice(invoiceId: string) {
+  await requireAdmin()
+  const db = getAdminDb()
+  const ref = db.collection("invoices").doc(invoiceId)
+  const doc = await ref.get()
+  if (!doc.exists) throw new Error("Invoice không tồn tại")
+  if (doc.data()!.status !== "UNPAID") throw new Error("Chỉ hủy được hóa đơn chưa thanh toán")
+  await ref.update({ status: "CANCELED", canceledAt: FieldValue.serverTimestamp() })
+}
+
+// ── Suspend Invoice (PAID only) ───────────────────────────────────────────────
+export async function suspendInvoice(invoiceId: string) {
+  await requireAdmin()
+  const db = getAdminDb()
+  const ref = db.collection("invoices").doc(invoiceId)
+  const doc = await ref.get()
+  if (!doc.exists) throw new Error("Invoice không tồn tại")
+  if (doc.data()!.status !== "PAID") throw new Error("Chỉ đình chỉ được hóa đơn đã thanh toán")
+  await ref.update({ status: "SUSPENDED", suspendedAt: FieldValue.serverTimestamp() })
+}
+
+// ── Refund Invoice (Firestore Transaction — Treasury Logic) ───────────────────
+export async function refundInvoice(invoiceId: string, merchantId: string, amount: number) {
+  const decoded = await requireAdmin()
+  const db = getAdminDb()
+  const rootAdminUid = decoded.uid // The admin performing the refund is the treasury source
+
+  await db.runTransaction(async (t) => {
+    // 1. Read balances
+    const adminRef = db.collection("users").doc(rootAdminUid)
+    const merchantRef = db.collection("users").doc(merchantId)
+    const invoiceRef = db.collection("invoices").doc(invoiceId)
+
+    const [adminDoc, merchantDoc, invoiceDoc] = await Promise.all([
+      t.get(adminRef), t.get(merchantRef), t.get(invoiceRef),
+    ])
+
+    if (!invoiceDoc.exists) throw new Error("Invoice không tồn tại")
+    if (invoiceDoc.data()!.status !== "SUSPENDED" && invoiceDoc.data()!.status !== "PAID") {
+      throw new Error("Chỉ hoàn tiền được hóa đơn đã thanh toán hoặc đình chỉ")
+    }
+
+    const adminBalance = adminDoc.exists ? (adminDoc.data()!.mainBalance || 0) : 0
+    if (adminBalance < amount) throw new Error("Số dư Admin không đủ để hoàn tiền")
+
+    const merchantBalance = merchantDoc.exists ? (merchantDoc.data()!.mainBalance || 0) : 0
+
+    // 2. Transfer funds: Admin → Merchant
+    t.update(adminRef, { mainBalance: adminBalance - amount })
+    t.update(merchantRef, { mainBalance: merchantBalance + amount })
+
+    // 3. Update invoice status
+    t.update(invoiceRef, {
+      status: "REFUNDED",
+      refundedAt: FieldValue.serverTimestamp(),
+      refundedBy: rootAdminUid,
+      refundAmount: amount,
+    })
+
+    // 4. Create refund transaction record
+    const txId = uuidv4()
+    t.set(db.collection("transactions").doc(txId), {
+      transactionId: txId,
+      type: "REFUND",
+      senderId: rootAdminUid,
+      receiverId: merchantId,
+      amount,
+      netAmount: amount,
+      fee: 0,
+      status: "COMPLETED",
+      description: `Hoàn tiền hóa đơn ${invoiceId.slice(0, 8)}...`,
+      category: "TRANSFER",
+      timestamp: FieldValue.serverTimestamp(),
+    })
+  })
+
+  // Notify merchant
+  await db.collection("merchants").doc(merchantId)
+    .collection("notifications").add({
+      type: "INVOICE_REFUNDED", invoiceId,
+      message: `Hóa đơn ${invoiceId.slice(0, 8)}... đã được hoàn tiền ${amount.toLocaleString("vi-VN")}₫`,
+      read: false, createdAt: FieldValue.serverTimestamp(),
+    })
+}

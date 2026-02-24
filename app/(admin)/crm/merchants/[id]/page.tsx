@@ -2,7 +2,11 @@
 import { useEffect, useState } from "react"
 import { useParams, useRouter } from "next/navigation"
 import { motion } from "framer-motion"
-import { getMerchantDetail, freezeMerchant, updateMerchantPlan, updateMerchantTier, updateMerchantProfile, createUpgradeInvoice, getInvoicesForMerchant, approveInvoice } from "@/lib/actions/crm"
+import {
+    getMerchantDetail, freezeMerchant, updateMerchantPlan, updateMerchantTier,
+    updateMerchantProfile, createUpgradeInvoice, getInvoicesForMerchant,
+    approveInvoice, editInvoice, cancelInvoice, suspendInvoice, refundInvoice,
+} from "@/lib/actions/crm"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -14,7 +18,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, Dialog
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { toast } from "@/hooks/use-toast"
-import { ArrowLeft, Loader2, Snowflake, CheckCircle, Building2, Link2, ArrowUpDown, Pencil, Receipt, Plus, Check } from "lucide-react"
+import { ArrowLeft, Loader2, Snowflake, CheckCircle, Building2, Link2, ArrowUpDown, Pencil, Receipt, Plus, Check, RefreshCw, XCircle, Pause, Undo2 } from "lucide-react"
 
 const PLANS = ["FREE", "PRO", "ENTERPRISE"] as const
 const MERCHANT_TIERS = ["BUSINESS", "PREMIUM_BUSINESS"] as const
@@ -37,6 +41,12 @@ export default function MerchantDetailPage() {
     const [invOpen, setInvOpen] = useState(false)
     const [invAmount, setInvAmount] = useState("")
     const [invPlan, setInvPlan] = useState<"FREE" | "PRO" | "ENTERPRISE">("PRO")
+
+    // Edit invoice state
+    const [editInvOpen, setEditInvOpen] = useState(false)
+    const [editInvId, setEditInvId] = useState("")
+    const [editInvAmount, setEditInvAmount] = useState("")
+    const [editInvPlan, setEditInvPlan] = useState<"FREE" | "PRO" | "ENTERPRISE">("PRO")
 
     useEffect(() => {
         getMerchantDetail(id).then(d => { setData(d); setLoading(false) }).catch(() => setLoading(false))
@@ -109,6 +119,56 @@ export default function MerchantDetailPage() {
             // Also refresh merchant data (plan changed)
             const refreshed = await getMerchantDetail(id)
             setData(refreshed)
+        } catch (e: any) { toast({ title: "Lỗi", description: e.message, variant: "destructive" }) }
+        finally { setProcessing(false) }
+    }
+
+    async function refreshInvoices() {
+        const updated = await getInvoicesForMerchant(id)
+        setInvoices(updated)
+        const refreshed = await getMerchantDetail(id)
+        setData(refreshed)
+    }
+
+    async function handleCancelInvoice(invoiceId: string) {
+        setProcessing(true)
+        try {
+            await cancelInvoice(invoiceId)
+            toast({ title: "Đã hủy hóa đơn" })
+            await refreshInvoices()
+        } catch (e: any) { toast({ title: "Lỗi", description: e.message, variant: "destructive" }) }
+        finally { setProcessing(false) }
+    }
+
+    async function handleSuspendInvoice(invoiceId: string) {
+        setProcessing(true)
+        try {
+            await suspendInvoice(invoiceId)
+            toast({ title: "Đã đình chỉ hóa đơn" })
+            await refreshInvoices()
+        } catch (e: any) { toast({ title: "Lỗi", description: e.message, variant: "destructive" }) }
+        finally { setProcessing(false) }
+    }
+
+    async function handleRefundInvoice(invoiceId: string, merchantUid: string, amount: number) {
+        setProcessing(true)
+        try {
+            await refundInvoice(invoiceId, merchantUid, amount)
+            toast({ title: "Đã hoàn tiền thành công!" })
+            await refreshInvoices()
+        } catch (e: any) { toast({ title: "Lỗi hoàn tiền", description: e.message, variant: "destructive" }) }
+        finally { setProcessing(false) }
+    }
+
+    async function handleEditInvoice() {
+        const amt = parseInt(editInvAmount)
+        if (!amt || amt <= 0) { toast({ title: "Số tiền không hợp lệ", variant: "destructive" }); return }
+        setProcessing(true)
+        try {
+            await editInvoice(editInvId, amt, editInvPlan)
+            toast({ title: "Đã cập nhật hóa đơn" })
+            setEditInvOpen(false)
+            await refreshInvoices()
         } catch (e: any) { toast({ title: "Lỗi", description: e.message, variant: "destructive" }) }
         finally { setProcessing(false) }
     }
@@ -214,9 +274,14 @@ export default function MerchantDetailPage() {
                 {/* Invoices Tab */}
                 <TabsContent value="invoices" className="mt-4 space-y-4">
                     <Dialog open={invOpen} onOpenChange={setInvOpen}>
-                        <DialogTrigger asChild>
-                            <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700"><Plus className="w-4 h-4 mr-2" />Tạo hóa đơn nâng cấp</Button>
-                        </DialogTrigger>
+                        <div className="flex items-center gap-2">
+                            <DialogTrigger asChild>
+                                <Button size="sm" className="bg-emerald-600 hover:bg-emerald-700"><Plus className="w-4 h-4 mr-2" />Tạo hóa đơn nâng cấp</Button>
+                            </DialogTrigger>
+                            <Button size="sm" variant="outline" className="border-white/10" onClick={refreshInvoices}>
+                                <RefreshCw className="w-4 h-4" />
+                            </Button>
+                        </div>
                         <DialogContent className="bg-slate-900 border-white/10 text-white max-w-sm">
                             <DialogHeader><DialogTitle>Tạo hóa đơn nâng cấp</DialogTitle></DialogHeader>
                             <div className="space-y-3">
@@ -261,11 +326,40 @@ export default function MerchantDetailPage() {
                                                 {inv.status}
                                             </Badge>
                                         </TableCell>
-                                        <TableCell>
+                                        <TableCell className="space-x-1">
+                                            {inv.status === "UNPAID" && (
+                                                <>
+                                                    <Button size="sm" variant="outline" disabled={processing}
+                                                        onClick={() => { setEditInvId(inv.invoiceId); setEditInvAmount(String(inv.amount)); setEditInvPlan(inv.targetPlan); setEditInvOpen(true) }}
+                                                        className="border-white/10 text-xs text-blue-400">
+                                                        <Pencil className="w-3 h-3 mr-1" />Sửa
+                                                    </Button>
+                                                    <Button size="sm" variant="outline" disabled={processing}
+                                                        onClick={() => handleCancelInvoice(inv.invoiceId)}
+                                                        className="border-white/10 text-xs text-red-400">
+                                                        <XCircle className="w-3 h-3 mr-1" />Hủy
+                                                    </Button>
+                                                </>
+                                            )}
                                             {inv.status === "PAID" && (
-                                                <Button size="sm" variant="outline" disabled={processing} onClick={() => handleApproveInvoice(inv.invoiceId)}
-                                                    className="border-white/10 text-xs text-green-400">
-                                                    <Check className="w-3 h-3 mr-1" />Duyệt
+                                                <>
+                                                    <Button size="sm" variant="outline" disabled={processing}
+                                                        onClick={() => handleApproveInvoice(inv.invoiceId)}
+                                                        className="border-white/10 text-xs text-green-400">
+                                                        <Check className="w-3 h-3 mr-1" />Duyệt
+                                                    </Button>
+                                                    <Button size="sm" variant="outline" disabled={processing}
+                                                        onClick={() => handleSuspendInvoice(inv.invoiceId)}
+                                                        className="border-white/10 text-xs text-yellow-400">
+                                                        <Pause className="w-3 h-3 mr-1" />Đình chỉ
+                                                    </Button>
+                                                </>
+                                            )}
+                                            {inv.status === "SUSPENDED" && (
+                                                <Button size="sm" variant="outline" disabled={processing}
+                                                    onClick={() => handleRefundInvoice(inv.invoiceId, m.userId || id, inv.amount)}
+                                                    className="border-white/10 text-xs text-purple-400">
+                                                    <Undo2 className="w-3 h-3 mr-1" />Hoàn tiền
                                                 </Button>
                                             )}
                                         </TableCell>
@@ -274,6 +368,28 @@ export default function MerchantDetailPage() {
                             </TableBody>
                         </Table>
                     </div>
+
+                    {/* Edit Invoice Dialog */}
+                    <Dialog open={editInvOpen} onOpenChange={setEditInvOpen}>
+                        <DialogContent className="bg-slate-900 border-white/10 text-white max-w-sm">
+                            <DialogHeader><DialogTitle>Sửa hóa đơn</DialogTitle></DialogHeader>
+                            <div className="space-y-3">
+                                <div><Label>Gói đích</Label>
+                                    <Select value={editInvPlan} onValueChange={v => setEditInvPlan(v as any)}>
+                                        <SelectTrigger className="mt-1 bg-white/5 border-white/10 text-white"><SelectValue /></SelectTrigger>
+                                        <SelectContent className="bg-slate-900 border-white/10">
+                                            {PLANS.map(p => <SelectItem key={p} value={p} className="text-white">{p}</SelectItem>)}
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+                                <div><Label>Số tiền (VND)</Label>
+                                    <Input type="number" value={editInvAmount} onChange={e => setEditInvAmount(e.target.value)}
+                                        className="mt-1 bg-white/5 border-white/10 text-white" placeholder="500000" />
+                                </div>
+                                <Button onClick={handleEditInvoice} disabled={processing} className="w-full bg-blue-600 hover:bg-blue-700">Lưu thay đổi</Button>
+                            </div>
+                        </DialogContent>
+                    </Dialog>
                 </TabsContent>
 
                 {/* Payment Links Tab */}
