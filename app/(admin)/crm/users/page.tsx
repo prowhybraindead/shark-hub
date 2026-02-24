@@ -1,5 +1,6 @@
 "use client"
 import { useEffect, useState } from "react"
+import { useRouter } from "next/navigation"
 import { motion } from "framer-motion"
 import { getAllUsers, freezeUser, updateUserTier, provisionBusinessWallet } from "@/lib/actions/crm"
 import { formatCurrency, formatDate } from "@/lib/utils"
@@ -20,6 +21,7 @@ const TIER_COLORS: Record<string, string> = {
 }
 
 export default function UsersPage() {
+  const router = useRouter()
   const [users, setUsers] = useState<any[]>([])
   const [filtered, setFiltered] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
