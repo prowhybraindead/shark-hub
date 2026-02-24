@@ -415,66 +415,69 @@ export async function suspendInvoice(invoiceId: string) {
   await ref.update({ status: "SUSPENDED", suspendedAt: FieldValue.serverTimestamp() })
 }
 
-// ── Refund Invoice (Firestore Transaction — Treasury Logic) ───────────────────
-export async function refundInvoice(invoiceId: string, merchantId: string, amount: number) {
-  const decoded = await requireAdmin()
+// ── Refund Invoice (Atomic Batch — Bulletproof Treasury Logic) ────────────────
+export async function refundInvoice(invoiceId: string, merchantId?: string, _amount?: number) {
+  await requireAdmin()
   const db = getAdminDb()
-  const rootAdminUid = decoded.uid // The admin performing the refund is the treasury source
 
-  await db.runTransaction(async (t) => {
-    // 1. Read balances
-    const adminRef = db.collection("users").doc(rootAdminUid)
-    const merchantRef = db.collection("users").doc(merchantId)
-    const invoiceRef = db.collection("invoices").doc(invoiceId)
+  // 1. Read invoice — single source of truth for amount and payer
+  const invoiceRef = db.collection("invoices").doc(invoiceId)
+  const invoiceSnap = await invoiceRef.get()
+  if (!invoiceSnap.exists) throw new Error("Hóa đơn không tồn tại")
+  const invoiceData = invoiceSnap.data()!
 
-    const [adminDoc, merchantDoc, invoiceDoc] = await Promise.all([
-      t.get(adminRef), t.get(merchantRef), t.get(invoiceRef),
-    ])
+  if (invoiceData.status !== "PAID" && invoiceData.status !== "SUSPENDED") {
+    throw new Error("Chỉ hoàn tiền được hóa đơn đã thanh toán hoặc đình chỉ")
+  }
 
-    if (!invoiceDoc.exists) throw new Error("Invoice không tồn tại")
-    if (invoiceDoc.data()!.status !== "SUSPENDED" && invoiceDoc.data()!.status !== "PAID") {
-      throw new Error("Chỉ hoàn tiền được hóa đơn đã thanh toán hoặc đình chỉ")
-    }
+  const refundAmount = Number(invoiceData.amount)
+  if (!refundAmount || refundAmount <= 0) throw new Error("Số tiền hoàn không hợp lệ")
 
-    const adminBalance = adminDoc.exists ? (adminDoc.data()!.mainBalance || 0) : 0
-    if (adminBalance < amount) throw new Error("Số dư Admin không đủ để hoàn tiền")
+  // The user who actually paid this invoice
+  const payerId = invoiceData.paidBy || invoiceData.userId || merchantId
+  if (!payerId) throw new Error("Không xác định được người thanh toán")
 
-    const merchantBalance = merchantDoc.exists ? (merchantDoc.data()!.mainBalance || 0) : 0
+  const payerRef = db.collection("users").doc(payerId)
 
-    // 2. Transfer funds: Admin → Merchant
-    t.update(adminRef, { mainBalance: adminBalance - amount })
-    t.update(merchantRef, { mainBalance: merchantBalance + amount })
+  // 2. Atomic batch: all succeed or all fail
+  const batch = db.batch()
 
-    // 3. Update invoice status
-    t.update(invoiceRef, {
-      status: "REFUNDED",
-      refundedAt: FieldValue.serverTimestamp(),
-      refundedBy: rootAdminUid,
-      refundAmount: amount,
-    })
+  // a) Credit payer's balance using atomic increment
+  batch.update(payerRef, { mainBalance: FieldValue.increment(refundAmount) })
 
-    // 4. Create refund transaction record
-    const txId = uuidv4()
-    t.set(db.collection("transactions").doc(txId), {
-      transactionId: txId,
-      type: "REFUND",
-      senderId: rootAdminUid,
-      receiverId: merchantId,
-      amount,
-      netAmount: amount,
-      fee: 0,
-      status: "COMPLETED",
-      description: `Hoàn tiền hóa đơn ${invoiceId.slice(0, 8)}...`,
-      category: "TRANSFER",
-      timestamp: FieldValue.serverTimestamp(),
-    })
+  // b) Log refund transaction
+  const txRef = db.collection("transactions").doc(uuidv4())
+  batch.set(txRef, {
+    transactionId: txRef.id,
+    type: "REFUND",
+    senderId: "SYSTEM",
+    receiverId: payerId,
+    amount: refundAmount,
+    netAmount: refundAmount,
+    fee: 0,
+    status: "COMPLETED",
+    description: `Hoàn tiền hóa đơn ${invoiceId.slice(0, 8)}...`,
+    category: "TRANSFER",
+    timestamp: FieldValue.serverTimestamp(),
   })
 
-  // Notify merchant
-  await db.collection("merchants").doc(merchantId)
-    .collection("notifications").add({
-      type: "INVOICE_REFUNDED", invoiceId,
-      message: `Hóa đơn ${invoiceId.slice(0, 8)}... đã được hoàn tiền ${amount.toLocaleString("vi-VN")}₫`,
-      read: false, createdAt: FieldValue.serverTimestamp(),
-    })
+  // c) Update invoice status
+  batch.update(invoiceRef, {
+    status: "REFUNDED",
+    refundedAt: FieldValue.serverTimestamp(),
+    refundAmount,
+  })
+
+  await batch.commit()
+
+  // 3. Notify merchant (non-critical, outside batch)
+  const mId = invoiceData.merchantId || merchantId
+  if (mId) {
+    await db.collection("merchants").doc(mId)
+      .collection("notifications").add({
+        type: "INVOICE_REFUNDED", invoiceId,
+        message: `Hóa đơn ${invoiceId.slice(0, 8)}... đã được hoàn tiền ${refundAmount.toLocaleString("vi-VN")}₫`,
+        read: false, createdAt: FieldValue.serverTimestamp(),
+      })
+  }
 }
