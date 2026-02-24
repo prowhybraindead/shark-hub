@@ -10,9 +10,9 @@ const nextConfig = {
   },
   experimental: {
     serverActions: {
-      allowedOrigins: ["localhost:3002", "*.vercel.app", "hub.selfservice.io.vn"]
+      allowedOrigins: ["localhost:3002", "*.vercel.app", "sharkhub.selfservice.io.vn"]
     }
   },
 }
 
-export default nextConfig;
+export default nextConfig; b
