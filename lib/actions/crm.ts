@@ -5,6 +5,12 @@ import { cookies } from "next/headers"
 import { v4 as uuidv4 } from "uuid"
 import { serializeFirestoreData } from "@/lib/utils"
 
+function getTreasuryUid(): string {
+  const uid = process.env.TREASURY_UID
+  if (!uid) throw new Error("System Error: Treasury UID not configured.")
+  return uid
+}
+
 async function requireAdmin() {
   const cookieStore = cookies()
   const session = cookieStore.get("session")?.value
@@ -329,6 +335,7 @@ export async function createUpgradeInvoice(data: {
   await db.collection("invoices").doc(invoiceId).set({
     invoiceId, merchantId: data.merchantId,
     amount: data.amount, targetPlan: data.targetPlan,
+    receiverId: getTreasuryUid(),
     status: "UNPAID", createdBy: decoded.uid,
     createdAt: FieldValue.serverTimestamp(),
   })
@@ -441,16 +448,21 @@ export async function refundInvoice(invoiceId: string, merchantId?: string, _amo
 
   // 2. Atomic batch: all succeed or all fail
   const batch = db.batch()
+  const treasuryUid = getTreasuryUid()
+  const treasuryRef = db.collection("users").doc(treasuryUid)
 
-  // a) Credit payer's balance using atomic increment
-  batch.update(payerRef, { mainBalance: FieldValue.increment(refundAmount) })
+  // a) Deduct from Treasury
+  batch.update(treasuryRef, { mainBalance: FieldValue.increment(-Math.abs(refundAmount)) })
 
-  // b) Log refund transaction
+  // b) Credit payer's balance
+  batch.update(payerRef, { mainBalance: FieldValue.increment(Math.abs(refundAmount)) })
+
+  // c) Log refund transaction
   const txRef = db.collection("transactions").doc(uuidv4())
   batch.set(txRef, {
     transactionId: txRef.id,
     type: "REFUND",
-    senderId: "SYSTEM",
+    senderId: treasuryUid,
     receiverId: payerId,
     amount: refundAmount,
     netAmount: refundAmount,
